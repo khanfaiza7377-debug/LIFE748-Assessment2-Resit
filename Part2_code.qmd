@@ -1,7 +1,5 @@
 ---
 title: "LIFE748 Assessment 2 — Part 2: Machine Learning Analysis of Differential Expression"
-author: "<YOUR NAME> (<YOUR STUDENT ID>)"
-date: "August 2026"
 format:
   html:
     toc: true
