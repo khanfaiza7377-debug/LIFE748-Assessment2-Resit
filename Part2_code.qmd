@@ -1,0 +1,581 @@
+---
+title: "LIFE748 Assessment 2 — Part 2: Machine Learning Analysis of Differential Expression"
+author: "<YOUR NAME> (<YOUR STUDENT ID>)"
+date: "August 2026"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    embed-resources: true
+editor: visual
+---
+
+<!--
+################################################################################
+ GENERATIVE AI DECLARATION
+ Generative AI (Anthropic Claude, model claude-opus-5, accessed August 2026) was
+ used to assist in drafting, structuring and commenting the code in this
+ document. All analytical choices, parameter settings, and the interpretation of
+ all results were reviewed, tested and verified by the author. The complete
+ prompt / interaction history is provided in the supplementary file
+ GAI_declaration_and_prompts.md.
+################################################################################
+-->
+
+## Aim
+
+Can machine learning approaches discriminate two experimental conditions from *E. coli*
+gene expression profiles, and which expression features are the most informative markers?
+
+This document takes a raw count matrix of 4,464 *E. coli* K-12 genes measured across 50
+samples (25 per condition), identifies differentially expressed genes (DEGs) with DESeq2,
+and then asks whether unsupervised clustering recovers the condition labels and whether
+supervised classifiers can predict them. A deliberate emphasis is placed on **evaluating
+the classifiers honestly** — a single train/test split is shown to be an unreliable basis
+for comparison, and is replaced with repeated splits and nested feature selection.
+
+## Step 0: Load the required libraries
+
+```{r setup, warning=FALSE, message=FALSE}
+library(DESeq2)        # Bioconductor 1.42.0 — normalisation and differential expression
+library(ggplot2)       # CRAN 3.4.4  — all plotting
+library(ggrepel)       # CRAN 0.9.5  — non-overlapping gene labels on the volcano plot
+library(pheatmap)      # CRAN 1.0.12 — clustered heatmap
+library(caret)         # CRAN 6.0.94 — confusion matrices and data splitting
+library(MASS)          # CRAN 7.3.60 — Linear Discriminant Analysis
+library(e1071)         # CRAN 1.7.14 — Support Vector Machines
+library(cluster)       # CRAN 2.1.6  — silhouette analysis
+library(mclust)        # CRAN 6.0.1  — adjusted Rand index
+library(RColorBrewer)  # CRAN 1.1.3  — colour palettes
+
+set.seed(42)           # single global seed so that every result below is reproducible
+
+# Consistent styling for all figures
+theme_set(theme_bw(base_size = 11) +
+          theme(panel.grid.minor = element_blank(),
+                strip.background = element_rect(fill = "grey92", colour = NA)))
+COND_COLS <- c(CondA = "#3B6FB6", CondB = "#D1642E")
+FIGDIR <- "figures"; dir.create(FIGDIR, showWarnings = FALSE)
+RESDIR <- "results"; dir.create(RESDIR, showWarnings = FALSE)
+```
+
+## Step 1: Load the count matrix
+
+The count matrix contains raw (un-normalised) integer counts. Rows are *E. coli* K-12
+MG1655 locus tags (b-numbers); the first 25 columns are Condition A and the next 25 are
+Condition B.
+
+```{r load}
+counts <- read.csv("dataset_LIFE748_1.csv", row.names = 1)
+
+# Locus tag (b-number) -> gene symbol mapping. b-numbers alone are unreadable in
+# figures, so every table and plot below is annotated with the common gene symbol.
+# The mapping was compiled from the EcoCyc-derived MG1655 gene table distributed with
+# the CovertLab whole-cell model (Macklin et al. 2020) and is supplied as
+# gene_names.csv alongside this document.
+gene_names <- read.csv("gene_names.csv", stringsAsFactors = FALSE)
+sym <- setNames(gene_names$symbol, gene_names$gene)
+lab_of <- function(b) ifelse(is.na(sym[b]) | sym[b] == "", b, sym[b])
+
+colData <- data.frame(
+  row.names = colnames(counts),
+  Condition = factor(c(rep("CondA", 25), rep("CondB", 25)), levels = c("CondA", "CondB"))
+)
+
+# Descriptive summary of the input — library size varies ~2-fold between samples,
+# which is exactly why a normalisation step (rather than raw counts) is required.
+lib_sizes <- colSums(counts)
+cat(sprintf("Genes: %d | Samples: %d\n", nrow(counts), ncol(counts)))
+cat(sprintf("Library size: min %.2f M, max %.2f M, mean %.2f M, CV %.1f%%\n",
+            min(lib_sizes)/1e6, max(lib_sizes)/1e6, mean(lib_sizes)/1e6,
+            100*sd(lib_sizes)/mean(lib_sizes)))
+cat(sprintf("Genes with zero counts in all samples: %d\n", sum(rowSums(counts) == 0)))
+
+write.csv(data.frame(Sample = names(lib_sizes), LibrarySize = lib_sizes,
+                     Condition = colData$Condition),
+          file.path(RESDIR, "Table_S1_library_sizes.csv"), row.names = FALSE)
+```
+
+## Step 2: Normalise and identify DEGs with DESeq2
+
+DESeq2 models counts with a negative binomial distribution, estimates a size factor per
+sample by the median-of-ratios method to correct for sequencing depth, shrinks
+gene-wise dispersion estimates towards a fitted trend, and tests each gene with a Wald
+test. Independent filtering of low-count genes is applied first, because genes with almost
+no reads carry no power and only inflate the multiple-testing burden.
+
+```{r deseq, message=FALSE, warning=FALSE}
+dds <- DESeqDataSetFromMatrix(countData = counts,
+                              colData   = colData,
+                              design    = ~ Condition)
+
+# Pre-filter: retain genes with at least 10 reads summed across all samples.
+keep <- rowSums(counts(dds)) >= 10
+cat(sprintf("Genes retained after pre-filtering: %d of %d\n", sum(keep), nrow(dds)))
+dds <- dds[keep, ]
+
+dds <- DESeq(dds)                       # size factors -> dispersions -> Wald test
+
+# Contrast is CondB relative to CondA: a positive log2FC means higher in Condition B.
+res <- results(dds, contrast = c("Condition", "CondB", "CondA"), alpha = 0.05)
+summary(res)
+res_df <- as.data.frame(res)
+res_df$gene   <- rownames(res_df)
+res_df$symbol <- lab_of(res_df$gene)
+
+# Variance-stabilising transformation: puts counts on a ~homoscedastic log2-like scale.
+# This is the correct input for distance-based and linear ML methods, which otherwise
+# would be dominated by the mean-variance relationship of raw counts.
+vsd <- vst(dds, blind = FALSE)
+normalized_counts <- assay(vsd)
+
+write.csv(res_df[order(res_df$padj), ],
+          file.path(RESDIR, "Table_S2_DESeq2_full_results.csv"), row.names = FALSE)
+```
+
+## Step 3: Report DEGs (table and volcano plot)
+
+Statistically significant DEGs are defined as adjusted p-value (Benjamini–Hochberg FDR)
+< 0.05 **and** |log2 fold change| > 1 (i.e. at least a two-fold change).
+
+```{r deg_table}
+PADJ_CUT <- 0.05; LFC_CUT <- 1
+
+res_df$sig <- with(res_df,
+  ifelse(!is.na(padj) & padj < PADJ_CUT & log2FoldChange >  LFC_CUT, "Up in CondB",
+  ifelse(!is.na(padj) & padj < PADJ_CUT & log2FoldChange < -LFC_CUT, "Down in CondB",
+         "Not significant")))
+
+deg_strict <- subset(res_df, sig != "Not significant")
+
+deg_summary <- data.frame(
+  Threshold = sprintf("padj < %.2f & |log2FC| > %.1f", PADJ_CUT, LFC_CUT),
+  Tested    = sum(!is.na(res_df$padj)),
+  Significant_padj_only = sum(res_df$padj < PADJ_CUT, na.rm = TRUE),
+  DEGs      = nrow(deg_strict),
+  Up_CondB  = sum(deg_strict$sig == "Up in CondB"),
+  Down_CondB= sum(deg_strict$sig == "Down in CondB"))
+print(deg_summary)
+
+# Top 20 DEGs by adjusted p-value — reported as the main DEG table.
+top20 <- head(deg_strict[order(deg_strict$padj),
+              c("gene","symbol","baseMean","log2FoldChange","lfcSE","pvalue","padj","sig")], 20)
+print(top20, digits = 3)
+
+write.csv(deg_strict[order(deg_strict$padj), ],
+          file.path(RESDIR, "Table_S3_significant_DEGs.csv"), row.names = FALSE)
+write.csv(deg_summary, file.path(RESDIR, "Table_1_DEG_summary.csv"), row.names = FALSE)
+```
+
+```{r volcano, fig.width=7, fig.height=5.5}
+# Volcano plot. Labels are restricted to the 15 most significant genes so that the
+# figure stays readable; ggrepel prevents the labels from overlapping.
+lab <- head(deg_strict[order(deg_strict$padj), ], 15)
+
+p_volcano <- ggplot(res_df, aes(x = log2FoldChange, y = -log10(pvalue), colour = sig)) +
+  geom_point(alpha = 0.6, size = 1.3) +
+  geom_vline(xintercept = c(-LFC_CUT, LFC_CUT), linetype = "dashed", colour = "grey40") +
+  geom_hline(yintercept = -log10(max(res_df$pvalue[res_df$padj < PADJ_CUT], na.rm = TRUE)),
+             linetype = "dashed", colour = "grey40") +
+  geom_text_repel(data = lab, aes(label = symbol), size = 2.8, max.overlaps = 20,
+                  fontface = "italic",
+                  show.legend = FALSE, colour = "black", segment.colour = "grey60") +
+  scale_colour_manual(values = c("Up in CondB" = "#D1642E",
+                                 "Down in CondB" = "#3B6FB6",
+                                 "Not significant" = "grey75")) +
+  labs(x = expression(log[2]~fold~change~(CondB/CondA)),
+       y = expression(-log[10]~italic(p)), colour = NULL,
+       title = "Differential expression between Condition A and Condition B") +
+  theme(legend.position = "top")
+
+print(p_volcano)
+ggsave(file.path(FIGDIR, "Figure1_volcano.png"), p_volcano,
+       width = 7, height = 5.5, dpi = 300)
+```
+
+## Step 4: Isolate differentially expressed genes for machine learning
+
+To reduce noise and dimensionality the normalised matrix is subset to significant genes.
+The fold-change threshold is relaxed to |log2FC| > 0.5 for this purpose: the strict
+two-fold cut is appropriate for *reporting* biology, but discarding genes with real but
+moderate effects would throw away discriminative signal the classifiers could use.
+
+In this dataset the relaxation makes no difference — *every* gene passing FDR < 0.05 also
+exceeds a two-fold change, so both thresholds return the same 77 genes. This is itself
+informative: with 25 replicates per condition the analysis has ample power, so the
+limiting factor is effect size rather than statistical significance, and there is no
+population of small-but-significant changes to recover.
+
+```{r ml_features}
+LFC_ML <- 0.5
+deg_ml <- subset(res_df, !is.na(padj) & padj < PADJ_CUT & abs(log2FoldChange) > LFC_ML)
+cat(sprintf("Features retained for ML (padj < %.2f & |log2FC| > %.1f): %d genes\n",
+            PADJ_CUT, LFC_ML, nrow(deg_ml)))
+
+ml_mat <- normalized_counts[deg_ml$gene, ]   # genes x samples (VST scale)
+X <- t(ml_mat)                               # samples x genes — the ML convention
+y <- colData$Condition
+cat(sprintf("ML matrix: %d samples x %d features\n", nrow(X), ncol(X)))
+```
+
+## Step 5: Unsupervised clustering
+
+Do the samples separate by condition *without* being told the labels? PCA is used to
+visualise the dominant structure, then k-means and hierarchical clustering are applied and
+their partitions compared to the true labels using the adjusted Rand index (ARI), which
+corrects agreement for chance (ARI = 1 is perfect, ~0 is random).
+
+```{r pca, fig.width=6, fig.height=4.5}
+pca <- prcomp(X, scale. = TRUE)
+var_exp <- 100 * pca$sdev^2 / sum(pca$sdev^2)
+
+pca_df <- data.frame(PC1 = pca$x[,1], PC2 = pca$x[,2],
+                     Condition = y, Sample = rownames(X))
+
+p_pca <- ggplot(pca_df, aes(PC1, PC2, colour = Condition)) +
+  geom_point(size = 2.6, alpha = 0.9) +
+  stat_ellipse(level = 0.95, linewidth = 0.4) +
+  scale_colour_manual(values = COND_COLS) +
+  labs(x = sprintf("PC1 (%.1f%%)", var_exp[1]),
+       y = sprintf("PC2 (%.1f%%)", var_exp[2]),
+       title = "PCA of VST expression across DEGs")
+print(p_pca)
+```
+
+### k-means
+
+```{r kmeans}
+# k = 2 because the experimental design contains two conditions. nstart = 25 restarts the
+# algorithm from 25 random initialisations and keeps the best, guarding against the
+# local optima that k-means is prone to.
+km <- kmeans(scale(X), centers = 2, nstart = 25)
+
+km_tab <- table(Cluster = km$cluster, Condition = y)
+print(km_tab)
+km_ari <- adjustedRandIndex(km$cluster, y)
+# Clustering accuracy: the labelling of clusters is arbitrary, so take the better of the
+# two possible cluster-to-condition assignments.
+km_acc <- max(sum(diag(km_tab)), sum(km_tab) - sum(diag(km_tab))) / sum(km_tab)
+cat(sprintf("k-means: ARI = %.3f, agreement with true labels = %.1f%%\n",
+            km_ari, 100*km_acc))
+
+# Silhouette width quantifies how well separated the two clusters are (1 = well
+# separated, ~0 = overlapping). It provides evidence independent of the known labels.
+sil <- silhouette(km$cluster, dist(scale(X)))
+cat(sprintf("Mean silhouette width: %.3f\n", mean(sil[, "sil_width"])))
+```
+
+### Hierarchical clustering
+
+```{r hclust}
+# Euclidean distance on VST values with Ward's linkage — Ward minimises within-cluster
+# variance and tends to recover compact, similarly-sized groups, which suits a balanced
+# 25 vs 25 design.
+d  <- dist(scale(X), method = "euclidean")
+hc <- hclust(d, method = "ward.D2")
+hc_clusters <- cutree(hc, k = 2)
+
+hc_tab <- table(Cluster = hc_clusters, Condition = y)
+print(hc_tab)
+hc_ari <- adjustedRandIndex(hc_clusters, y)
+hc_acc <- max(sum(diag(hc_tab)), sum(hc_tab) - sum(diag(hc_tab))) / sum(hc_tab)
+cat(sprintf("Hierarchical: ARI = %.3f, agreement with true labels = %.1f%%\n",
+            hc_ari, 100*hc_acc))
+
+clust_summary <- data.frame(
+  Method = c("k-means (k=2)", "Hierarchical (Ward.D2, k=2)"),
+  ARI = round(c(km_ari, hc_ari), 3),
+  Agreement_pct = round(100*c(km_acc, hc_acc), 1),
+  Mean_silhouette = round(c(mean(sil[,"sil_width"]),
+                            mean(silhouette(hc_clusters, d)[,"sil_width"])), 3))
+write.csv(clust_summary, file.path(RESDIR, "Table_2_clustering.csv"), row.names = FALSE)
+print(clust_summary)
+```
+
+### Visualise the clustering
+
+```{r heatmap, fig.width=8, fig.height=7}
+# Heatmap of the 50 most significant DEGs. Rows are z-scored so that the colour scale
+# reflects relative change across samples rather than absolute expression level, which
+# would otherwise be dominated by a handful of highly expressed genes.
+top50 <- head(deg_ml[order(deg_ml$padj), "gene"], 50)
+mat50 <- normalized_counts[top50, ]
+rownames(mat50) <- lab_of(top50)          # display gene symbols rather than b-numbers
+
+ann_col <- data.frame(Condition = y); rownames(ann_col) <- colnames(mat50)
+
+png(file.path(FIGDIR, "Figure2_heatmap.png"), width = 8, height = 7,
+    units = "in", res = 300)
+pheatmap(mat50,
+         scale = "row",
+         clustering_distance_cols = "euclidean",
+         clustering_method = "ward.D2",
+         annotation_col = ann_col,
+         annotation_colors = list(Condition = COND_COLS),
+         show_colnames = FALSE, fontsize_row = 6,
+         color = colorRampPalette(rev(brewer.pal(9, "RdBu")))(100),
+         main = "Top 50 DEGs (VST, row z-scored)")
+dev.off()
+
+pheatmap(mat50, scale = "row", clustering_distance_cols = "euclidean",
+         clustering_method = "ward.D2", annotation_col = ann_col,
+         annotation_colors = list(Condition = COND_COLS),
+         show_colnames = FALSE, fontsize_row = 6,
+         color = colorRampPalette(rev(brewer.pal(9, "RdBu")))(100),
+         main = "Top 50 DEGs (VST, row z-scored)")
+
+# Combined unsupervised figure (PCA coloured by true label and by k-means cluster)
+pca_df$kmeans <- factor(km$cluster)
+p_pca_km <- ggplot(pca_df, aes(PC1, PC2, colour = Condition, shape = kmeans)) +
+  geom_point(size = 2.8, alpha = 0.9) +
+  scale_colour_manual(values = COND_COLS) +
+  labs(x = sprintf("PC1 (%.1f%%)", var_exp[1]), y = sprintf("PC2 (%.1f%%)", var_exp[2]),
+       shape = "k-means cluster",
+       title = "Unsupervised structure recovers the experimental conditions")
+ggsave(file.path(FIGDIR, "Figure2b_PCA_kmeans.png"), p_pca_km,
+       width = 6.5, height = 4.5, dpi = 300)
+print(p_pca_km)
+```
+
+## Step 6: Supervised learning (logistic regression, LDA and SVM)
+
+With ~50 samples and many hundreds of DEGs the problem is strongly p >> n. LDA in
+particular requires the pooled within-class covariance matrix to be invertible, which is
+impossible when the number of features exceeds the number of training samples. All three
+classifiers are therefore trained on a reduced feature set of the **20 most significant
+DEGs**, which keeps the comparison between the three methods fair and well conditioned.
+
+```{r split}
+N_FEAT <- 20
+feat20 <- head(deg_ml[order(deg_ml$padj), "gene"], N_FEAT)
+
+dat <- as.data.frame(X[, feat20]); dat$Condition <- y
+
+# Stratified 70/30 split preserves the 50:50 class balance in both partitions.
+set.seed(42)
+idx   <- createDataPartition(dat$Condition, p = 0.7, list = FALSE)
+train <- dat[idx, ]; test <- dat[-idx, ]
+cat(sprintf("Training: %d samples | Testing: %d samples\n", nrow(train), nrow(test)))
+print(table(Set = c(rep("train", nrow(train)), rep("test", nrow(test))),
+            Condition = c(as.character(train$Condition), as.character(test$Condition))))
+```
+
+### Logistic regression
+
+```{r logreg, warning=FALSE, message=FALSE}
+# Even with 20 features and ~36 training samples, unpenalised logistic regression
+# separates the classes perfectly and the coefficients diverge (complete separation),
+# so a warning is expected. Ridge-penalised regression via glmnet is the standard
+# remedy and is used here for a stable, comparable model.
+suppressPackageStartupMessages(library(glmnet))
+xtr <- as.matrix(train[, feat20]); xte <- as.matrix(test[, feat20])
+set.seed(42)
+cv_lr  <- cv.glmnet(xtr, train$Condition, family = "binomial", alpha = 0, nfolds = 5)
+pred_lr <- factor(predict(cv_lr, newx = xte, s = "lambda.min", type = "class"),
+                  levels = levels(y))
+cm_lr <- confusionMatrix(pred_lr, test$Condition, positive = "CondB")
+print(cm_lr)
+```
+
+### Train LDA (Linear Discriminant Analysis)
+
+```{r lda}
+lda_fit  <- lda(Condition ~ ., data = train)
+pred_lda <- predict(lda_fit, test)$class
+cm_lda   <- confusionMatrix(pred_lda, test$Condition, positive = "CondB")
+print(cm_lda)
+```
+
+### Train SVM (Support Vector Machine)
+
+```{r svm}
+# A linear kernel is the appropriate default for high-dimensional expression data: the
+# classes are usually already linearly separable in that space, and a non-linear kernel
+# would add variance without adding signal. Cost is tuned by internal cross-validation.
+set.seed(42)
+svm_tune <- tune(svm, Condition ~ ., data = train, kernel = "linear",
+                 ranges = list(cost = c(0.01, 0.1, 1, 10, 100)),
+                 tunecontrol = tune.control(cross = 5))
+cat(sprintf("Best SVM cost: %g\n", svm_tune$best.parameters$cost))
+svm_fit  <- svm_tune$best.model
+pred_svm <- predict(svm_fit, test)
+cm_svm   <- confusionMatrix(pred_svm, test$Condition, positive = "CondB")
+print(cm_svm)
+```
+
+## Step 7: Compare classifier performance
+
+```{r compare}
+get_metrics <- function(cm, name) data.frame(
+  Model       = name,
+  Accuracy    = unname(cm$overall["Accuracy"]),
+  Kappa       = unname(cm$overall["Kappa"]),
+  Sensitivity = unname(cm$byClass["Sensitivity"]),
+  Specificity = unname(cm$byClass["Specificity"]),
+  Balanced_accuracy = unname(cm$byClass["Balanced Accuracy"]))
+
+single_split <- rbind(get_metrics(cm_lr,  "Logistic regression (ridge)"),
+                      get_metrics(cm_lda, "LDA"),
+                      get_metrics(cm_svm, "SVM (linear)"))
+print(single_split, digits = 3)
+write.csv(single_split, file.path(RESDIR, "Table_3_single_split_performance.csv"),
+          row.names = FALSE)
+```
+
+## Step 8: Is a single split enough?
+
+A single 70/30 split leaves only ~14 test samples, so accuracy moves in steps of ~7% and
+the three models frequently tie. Two further analyses are therefore run.
+
+**(a) Repeated random splits with nested feature selection.** In the analysis above the 20
+features were chosen using *all* 50 samples, including those later used for testing. This
+is selection bias and inflates the apparent accuracy. Below, the feature ranking is
+recomputed *inside each training split only* (by absolute two-sample t-statistic), so the
+test samples are never seen during either feature selection or model fitting.
+
+```{r repeated_cv, warning=FALSE, message=FALSE}
+N_REPEATS <- 100
+Xall <- t(normalized_counts)      # start from ALL genes, not the pre-selected DEGs
+
+run_split <- function(seed, nested = TRUE) {
+  set.seed(seed)
+  tr <- createDataPartition(y, p = 0.7, list = FALSE)
+  ytr <- y[tr]; yte <- y[-tr]
+
+  if (nested) {
+    # Feature selection using training samples ONLY
+    g1 <- Xall[tr, ][ytr == "CondA", ]; g2 <- Xall[tr, ][ytr == "CondB", ]
+    tstat <- (colMeans(g2) - colMeans(g1)) /
+             sqrt(apply(g2, 2, var)/nrow(g2) + apply(g1, 2, var)/nrow(g1))
+    fs <- names(sort(abs(tstat), decreasing = TRUE))[1:N_FEAT]
+  } else {
+    fs <- feat20                   # the biased, globally-selected feature set
+  }
+
+  dtr <- as.data.frame(Xall[tr, fs]);  dtr$Condition <- ytr
+  dte <- as.data.frame(Xall[-tr, fs]); dte$Condition <- yte
+
+  out <- list()
+  # ridge logistic regression
+  cvl <- cv.glmnet(as.matrix(dtr[, fs]), ytr, family = "binomial", alpha = 0, nfolds = 5)
+  out$LR  <- confusionMatrix(factor(predict(cvl, as.matrix(dte[, fs]),
+                                    s = "lambda.min", type = "class"), levels = levels(y)),
+                             yte, positive = "CondB")
+  out$LDA <- confusionMatrix(predict(lda(Condition ~ ., data = dtr), dte)$class,
+                             yte, positive = "CondB")
+  out$SVM <- confusionMatrix(predict(svm(Condition ~ ., data = dtr, kernel = "linear",
+                                         cost = 1), dte),
+                             yte, positive = "CondB")
+  do.call(rbind, lapply(names(out), function(m) data.frame(
+    seed = seed, Model = m, nested = nested,
+    Accuracy    = unname(out[[m]]$overall["Accuracy"]),
+    Sensitivity = unname(out[[m]]$byClass["Sensitivity"]),
+    Specificity = unname(out[[m]]$byClass["Specificity"]))))
+}
+
+rep_nested <- do.call(rbind, lapply(1:N_REPEATS, run_split, nested = TRUE))
+rep_biased <- do.call(rbind, lapply(1:N_REPEATS, run_split, nested = FALSE))
+reps <- rbind(rep_nested, rep_biased)
+
+cv_summary <- aggregate(cbind(Accuracy, Sensitivity, Specificity) ~ Model + nested,
+                        data = reps, FUN = function(v) c(mean = mean(v), sd = sd(v)))
+cv_summary <- do.call(data.frame, cv_summary)
+names(cv_summary) <- c("Model","Nested_FS","Acc_mean","Acc_sd","Sens_mean","Sens_sd",
+                       "Spec_mean","Spec_sd")
+print(cv_summary, digits = 3)
+write.csv(cv_summary, file.path(RESDIR, "Table_4_repeated_split_performance.csv"),
+          row.names = FALSE)
+
+# Range of accuracies across splits — the key evidence that one split is not enough
+acc_range <- aggregate(Accuracy ~ Model + nested, reps,
+                       function(v) sprintf("%.2f-%.2f", min(v), max(v)))
+print(acc_range)
+```
+
+```{r cv_figure, fig.width=7.5, fig.height=4.5}
+reps$Selection <- ifelse(reps$nested, "Nested (unbiased)", "Global (biased)")
+p_cv <- ggplot(reps, aes(x = Model, y = Accuracy, fill = Selection)) +
+  geom_boxplot(outlier.size = 0.6, alpha = 0.85, width = 0.65) +
+  geom_hline(yintercept = 0.5, linetype = "dotted", colour = "grey40") +
+  scale_fill_manual(values = c("Nested (unbiased)" = "#3B6FB6",
+                               "Global (biased)"   = "#C6C6C6")) +
+  scale_y_continuous(limits = c(0.1, 1.02)) +   # wide enough to retain every split
+  labs(y = "Test-set accuracy", x = NULL, fill = "Feature selection",
+       title = sprintf("Classifier accuracy across %d random 70/30 splits", N_REPEATS),
+       subtitle = "Dotted line = accuracy expected by chance") +
+  theme(legend.position = "top")
+print(p_cv)
+ggsave(file.path(FIGDIR, "Figure3_classifier_performance.png"), p_cv,
+       width = 7.5, height = 4.5, dpi = 300)
+```
+
+**(b) Repeated k-fold cross-validation via caret**, as a second, independent estimate.
+
+```{r kfold, warning=FALSE, message=FALSE}
+ctrl <- trainControl(method = "repeatedcv", number = 5, repeats = 10,
+                     classProbs = TRUE, summaryFunction = twoClassSummary,
+                     savePredictions = "final")
+set.seed(42)
+fit_lda <- train(Condition ~ ., data = dat, method = "lda",       trControl = ctrl, metric = "ROC")
+set.seed(42)
+fit_svm <- train(Condition ~ ., data = dat, method = "svmLinear", trControl = ctrl, metric = "ROC")
+set.seed(42)
+fit_lr  <- train(Condition ~ ., data = dat, method = "glmnet",    trControl = ctrl, metric = "ROC",
+                 tuneGrid = expand.grid(alpha = 0, lambda = 10^seq(-3, 2, length.out = 20)))
+
+kfold <- resamples(list(LDA = fit_lda, SVM = fit_svm, LR = fit_lr))
+print(summary(kfold))
+write.csv(summary(kfold)$statistics$ROC,
+          file.path(RESDIR, "Table_5_kfold_ROC.csv"))
+```
+
+## Step 9: Biologically informative markers
+
+The most informative features are identified in two complementary ways: by effect size
+from the differential expression analysis, and by how heavily each classifier weights the
+gene. Genes that rank highly under both are the strongest candidate markers, and are
+carried forward to the structural analysis in Part 3.
+
+```{r markers, fig.width=7.5, fig.height=5}
+# LDA discriminant loadings and linear-SVM weights, both on the 20-gene feature set
+lda_load <- data.frame(gene = rownames(lda_fit$scaling), LDA = as.numeric(lda_fit$scaling[,1]))
+svm_w    <- data.frame(gene = colnames(xtr),
+                       SVM  = as.numeric(t(svm_fit$coefs) %*% svm_fit$SV))
+imp <- merge(lda_load, svm_w, by = "gene")
+imp <- merge(imp, res_df[, c("gene","symbol","log2FoldChange","padj")], by = "gene")
+imp$rank_score <- rank(-abs(imp$LDA)) + rank(-abs(imp$SVM)) + rank(imp$padj)
+imp <- imp[order(imp$rank_score), ]
+print(head(imp, 15), digits = 3)
+write.csv(imp, file.path(RESDIR, "Table_6_marker_importance.csv"), row.names = FALSE)
+
+# Expression of the six top-ranked marker genes
+top6 <- head(imp$gene, 6)
+box_df <- data.frame(
+  gene = factor(rep(lab_of(top6), each = nrow(X)), levels = lab_of(top6)),
+  expr = as.vector(X[, top6]),
+  Condition = rep(y, times = length(top6)))
+
+p_markers <- ggplot(box_df, aes(Condition, expr, fill = Condition)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.8, width = 0.6) +
+  geom_jitter(width = 0.15, size = 0.8, alpha = 0.6) +
+  facet_wrap(~ gene, scales = "free_y", nrow = 2) +
+  scale_fill_manual(values = COND_COLS) +
+  labs(y = "VST-normalised expression", x = NULL,
+       title = "Top-ranked discriminative marker genes") +
+  theme(legend.position = "none")
+print(p_markers)
+ggsave(file.path(FIGDIR, "Figure4_marker_genes.png"), p_markers,
+       width = 7.5, height = 5, dpi = 300)
+
+# Export the candidate list for Part 3 (structural bioinformatics)
+write.csv(deg_strict[order(deg_strict$padj),
+                     c("gene","symbol","baseMean","log2FoldChange","padj","sig")],
+          file.path(RESDIR, "Table_S4_all77_DEGs_for_Part3.csv"), row.names = FALSE)
+```
+
+## Session information
+
+```{r session}
+sessionInfo()
+```
