@@ -95,4 +95,4 @@ Generative AI (Anthropic Claude, model `claude-opus-5`, August 2026) was used to
 assist in drafting, structuring and commenting these scripts, and to diagnose
 runtime failures. All analyses were executed and verified by the author and run independently on their own machine MacBook M1 2020, and
 every reported value derives from those runs. The full declaration and prompt
-history is submitted with the report as `GAI_declaration_and_prompts.md`.
+history is submitted with the report as `GAI_declaration_and_prompts.txt`.
