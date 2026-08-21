@@ -14,8 +14,7 @@
 # QUAST, BUSCO), that is stated explicitly in section 8 rather than left
 # implied by unused code.
 #
-# Author : <YOUR NAME>   Student ID: <YOUR STUDENT ID>
-# Date   : 21 August 2026
+# 
 #
 # -----------------------------------------------------------------------------
 # GENERATIVE AI DECLARATION
