@@ -3,7 +3,7 @@
 Benchmarking genome assembly, annotation, machine learning and structural
 prediction tools on a clinical *Escherichia coli* isolate (sample **GN3**).
 
-**Author:** \<YOUR NAME\> (\<YOUR STUDENT ID\>)
+**Author:** \<Faiza Khan\> (\<201936907\>)
 **Module:** LIFE748.1 Scientific Report, Assessment 2 — August 2026
 
 ---
