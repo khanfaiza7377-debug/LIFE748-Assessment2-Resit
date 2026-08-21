@@ -11,8 +11,7 @@ The predictions are then validated against curated PROSITE/UniProt HTH
 annotations, so the accuracy of the structural method can be quantified rather
 than merely asserted.
 
-Author: <YOUR NAME>  (<YOUR STUDENT ID>)
-Date:   August 2026
+
 
 -------------------------------------------------------------------------------
 GENERATIVE AI DECLARATION
