@@ -15,7 +15,6 @@ to assist in drafting and commenting this script. All analytical choices and the
 interpretation of results were reviewed and verified by the author. The full
 prompt/interaction history is provided in GAI_declaration_and_prompts.md.
 
-Author: <YOUR NAME>  Student ID: <YOUR STUDENT ID>
 """
 
 import matplotlib
